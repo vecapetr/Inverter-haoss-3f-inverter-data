@@ -6,4 +6,4 @@
 # place in directory modify variables (broker, port, user, passw - for MQTT, and usb rs232 device)
 # install apprioriate library for python (serial, time, json, binascii, paho.mqtt.publish, etc) 
 # in the moment is new version, my idea for future is grafana and influx (i must study more)
-# last version inverter_gg_xx_3f_010.py read data from 1 - 9 inverters
+# last version inverter_gg_xx_3f_013.py read data from 1 - 9 inverters and check 29 inverters values
