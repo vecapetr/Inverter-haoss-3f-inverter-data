@@ -7,3 +7,4 @@
 # install apprioriate library for python (serial, time, json, binascii, paho.mqtt.publish, etc) 
 # in the moment is new version, my idea for future is grafana and influx (i must study more)
 # last version inverter_gg_xx_3f_013.py read data from 1 - 9 inverters and check 29 inverters values
+# last version inverter_gg_xf_100.py some functionality bugs changed to better stability
