@@ -8,3 +8,5 @@
 # in the moment is new version, my idea for future is grafana and influx (i must study more)
 # last version inverter_gg_xx_203.py read data from 1 - 9 inverters and check inverters values and control 3phase loading to boilers with driving by zigbee controlers 0-10V and SSR modules
 # last version inverter_gg_xf_101.py some functionality bugs changed to better stability
+#
+# new sw inverter_new_
