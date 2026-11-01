@@ -1,12 +1,19 @@
 #!/usr/bin/env python3
 """
 EG.D HAN -> MQTT -> HA Discovery
-Podporuje: energie (kWh), výkon (W), tarif, relé, odpojovač, timeprint
+Podporuje: energie (kWh), výkon (W), proud (A), tarif, relé, odpojovač, timeprint
++ Sledování input_button.tc_restart přes HA REST API -> sudo reboot now
++ NT/VT mapování: T1, T2=VT, T3=NT, T4, tariff_code, dodávka do sítě
++ Výpočet proudů L1, L2, L3 (z výkonu a fixního napětí 240V)
 Kompatibilní s paho-mqtt >= 2.0 (Callback API v2)
 """
 import sys
 import time
 import json
+import threading
+import subprocess
+import urllib.request
+import urllib.error
 from datetime import datetime
 from dataclasses import dataclass
 
@@ -18,28 +25,51 @@ from paho.mqtt.client import CallbackAPIVersion
 PORT = "/dev/ttyUSB0"
 BAUDRATE = 9600
 
-MQTT_HOST = "192.168.1.22"
+MQTT_HOST = "ip HA"
 MQTT_PORT = 1883
-MQTT_USER = "edg"
-MQTT_PASS = "edg_1"
+MQTT_USER = "user z HA"
+MQTT_PASS = "heslo z HA"
 
-DEVICE_ID = "7d7f1d37359a485ca52ace13ee8d986c"
+DEVICE_ID = "id z HA"
 DEVICE_NAME = "EG.D Elektroměr"
 DEVICE_MANUFACTURER = "EG.D"
 DEVICE_MODEL = "HAN DLMS"
 
-MQTT_PREFIX = "edg"
+MQTT_PREFIX = "egd"
 DISCOVERY_PREFIX = "homeassistant"
+
+# Napětí pro výpočet proudu (fixně 240V)
+NOMINAL_VOLTAGE = 240.0
+
+# ============ HOME ASSISTANT REST API ============
+HA_URL    = "http://HA IP:8123"
+HA_TOKEN  = "long token z HA"
+HA_ENTITY = "input_button.egd_restart" #pokud přidáte toto tl tak pomocí něj restartnete RPi
+
+RESTART_COMMAND  = ["sudo", "-n", "/sbin/reboot", "now"]
+HA_POLL_INTERVAL = 2.0     # sekundy mezi dotazy na HA
+HA_HTTP_TIMEOUT  = 5.0     # timeout HTTP dotazu
+# ================================================
 
 # ============ OBIS KONFIGURACE ============
 OBIS_CONFIG = {
     # --- Energie (kWh) ---
     "1.8.0": {"key": "energy_import_kwh", "name": "EGD energie odběr celkem", "unit": "kWh", "scale": 0.001, "device_class": "energy", "state_class": "total_increasing"},
-    "1.8.1": {"key": "energy_import_t1_kwh", "name": "EGD energie odběr T1", "unit": "kWh", "scale": 0.001, "device_class": "energy", "state_class": "total_increasing"},
-    "1.8.2": {"key": "energy_import_t2_kwh", "name": "EGD energie odběr T2", "unit": "kWh", "scale": 0.001, "device_class": "energy", "state_class": "total_increasing"},
-    "1.8.3": {"key": "energy_import_t3_kwh", "name": "EGD energie odběr T3", "unit": "kWh", "scale": 0.001, "device_class": "energy", "state_class": "total_increasing"},
-    "1.8.4": {"key": "energy_import_t4_kwh", "name": "EGD energie odběr T4", "unit": "kWh", "scale": 0.001, "device_class": "energy", "state_class": "total_increasing"},
-    "2.8.0": {"key": "energy_export_kwh", "name": "EGD energie dodávka celkem", "unit": "kWh", "scale": 0.001, "device_class": "energy", "state_class": "total_increasing"},
+    
+    # T1
+    "1.8.1": {"key": "energy_import_t1_kwh", "name": "EGD energie odběr T1", "object_id": "eg_d_elektromer_energie_odber_t1", "unit": "kWh", "scale": 0.001, "device_class": "energy", "state_class": "total_increasing"},
+    
+    # T2 jako VT (vysoký tarif)
+    "1.8.2": {"key": "energy_import_t2_kwh", "name": "EGD VT vysoký tarif", "object_id": "eg_d_elektromer_vt_vysoky_tarif", "unit": "kWh", "scale": 0.001, "device_class": "energy", "state_class": "total_increasing"},
+    
+    # T3 jako NT (nízký tarif)
+    "1.8.3": {"key": "energy_import_t3_kwh", "name": "EGD NT nízký tarif", "object_id": "eg_d_elektromer_nt_nizky_tarif", "unit": "kWh", "scale": 0.001, "device_class": "energy", "state_class": "total_increasing"},
+    
+    # T4
+    "1.8.4": {"key": "energy_import_t4_kwh", "name": "EGD energie odběr T4", "object_id": "eg_d_elektromer_energie_odber_t4", "unit": "kWh", "scale": 0.001, "device_class": "energy", "state_class": "total_increasing"},
+    
+    # Dodávka do sítě (export)
+    "2.8.0": {"key": "energy_export_kwh", "name": "EGD dodávka do sítě", "object_id": "eg_d_elektromer_dodavka_do_site", "unit": "kWh", "scale": 0.001, "device_class": "energy", "state_class": "total_increasing"},
 
     # --- Výkon (W) ---
     "1.7.0": {"key": "power_import_w", "name": "EGD aktuální odběr", "unit": "W", "scale": 1, "device_class": "power", "state_class": "measurement"},
@@ -52,8 +82,15 @@ OBIS_CONFIG = {
     "62.7.0": {"key": "power_export_l3_w", "name": "EGD dodávka L3", "unit": "W", "scale": 1, "device_class": "power", "state_class": "measurement"},
     "17.0.0": {"key": "power_limiter_w", "name": "EGD hodnota omezovače", "unit": "W", "scale": 1, "device_class": "power", "state_class": "measurement"},
 
+    # --- Vypočítaný proud (A) ---
+    "calc_current_l1": {"key": "current_l1_a", "name": "EGD proud L1", "object_id": "eg_d_elektromer_proud_l1", "unit": "A", "scale": 1, "device_class": "current", "state_class": "measurement", "is_calculated": True},
+    "calc_current_l2": {"key": "current_l2_a", "name": "EGD proud L2", "object_id": "eg_d_elektromer_proud_l2", "unit": "A", "scale": 1, "device_class": "current", "state_class": "measurement", "is_calculated": True},
+    "calc_current_l3": {"key": "current_l3_a", "name": "EGD proud L3", "object_id": "eg_d_elektromer_proud_l3", "unit": "A", "scale": 1, "device_class": "current", "state_class": "measurement", "is_calculated": True},
+
     # --- Tarif a stav (enum) ---
-    "96.14.0": {"key": "tariff_code", "name": "EGD aktuální tarif kód", "unit": "", "scale": 1, "device_class": "", "state_class": ""},
+    # Tarifní kód
+    "96.14.0": {"key": "tariff_code", "name": "EGD aktuální tarif kód", "object_id": "eg_d_elektromer_tarif_code", "unit": "", "scale": 1, "device_class": "", "state_class": ""},
+    
     "96.13.0": {"key": "consumer_message", "name": "EGD zpráva zákazníkovi", "unit": "", "scale": 1, "device_class": "", "state_class": ""},
     "96.3.10": {"key": "disconnect_status", "name": "EGD odpojovač stav", "unit": "", "scale": 1, "device_class": "", "state_class": "", "enum_map": {0: "odpojeno", 1: "připojeno"}},
 
@@ -77,6 +114,10 @@ OBIS_CONFIG = {
         "is_timestamp": True,
     },
 }
+# ==========================================
+
+# Žádné entity k vymazání - vše chceme v Discovery
+DISCOVERY_DISABLED = []
 # ==========================================
 
 
@@ -151,11 +192,11 @@ class CosemParser:
 
 
 def decode_objects(objects: list[CosemObject]) -> dict:
-    """Dekóduje objekty podle OBIS_CONFIG (energie, výkon, enum)."""
+    """Dekóduje objekty podle OBIS_CONFIG a dopočítá proud."""
     results = {}
     for obj in objects:
         mapping = OBIS_CONFIG.get(obj.full_obis) or OBIS_CONFIG.get(obj.logical_name)
-        if not mapping:
+        if not mapping or mapping.get("is_calculated"):
             continue
 
         key = mapping["key"]
@@ -185,7 +226,121 @@ def decode_objects(objects: list[CosemObject]) -> dict:
             "obis": obj.logical_name,
         }
 
+    # --- Výpočet proudů L1, L2, L3 z výkonu a fixního napětí ---
+    p_l1 = results.get("power_l1_w", {}).get("value", 0)
+    p_l2 = results.get("power_l2_w", {}).get("value", 0)
+    p_l3 = results.get("power_l3_w", {}).get("value", 0)
+
+    # Pojistka, aby se vypočítané hodnoty přidaly jen tehdy, když máme naměřený výkon
+    # (pokud výkon chybí, zůstane 0, což je v pořádku, ale chceme zajistit konzistenci)
+    results["current_l1_a"] = {
+        "name": "EGD proud L1",
+        "value": round(p_l1 / NOMINAL_VOLTAGE, 2),
+        "is_enum": False,
+        "unit": "A",
+        "device_class": "current",
+        "state_class": "measurement",
+        "obis": "vypočteno",
+    }
+    results["current_l2_a"] = {
+        "name": "EGD proud L2",
+        "value": round(p_l2 / NOMINAL_VOLTAGE, 2),
+        "is_enum": False,
+        "unit": "A",
+        "device_class": "current",
+        "state_class": "measurement",
+        "obis": "vypočteno",
+    }
+    results["current_l3_a"] = {
+        "name": "EGD proud L3",
+        "value": round(p_l3 / NOMINAL_VOLTAGE, 2),
+        "is_enum": False,
+        "unit": "A",
+        "device_class": "current",
+        "state_class": "measurement",
+        "obis": "vypočteno",
+    }
+
     return results
+
+
+# ============ HOME ASSISTANT REST API ============
+def ha_get_state(entity_id: str) -> dict | None:
+    """Vrátí JSON se stavem entity z HA, nebo None při chybě."""
+    url = f"{HA_URL}/api/states/{entity_id}"
+    req = urllib.request.Request(
+        url,
+        headers={
+            "Authorization": f"Bearer {HA_TOKEN}",
+            "Content-Type": "application/json",
+        },
+        method="GET",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=HA_HTTP_TIMEOUT) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        if e.code == 401:
+            print(f"❌ HA HTTP 401 – neplatný token (zkontroluj HA_TOKEN)")
+        elif e.code == 404:
+            print(f"❌ HA HTTP 404 – entita {entity_id} neexistuje")
+        else:
+            print(f"❌ HA HTTP {e.code} pro {entity_id}: {e.reason}")
+    except urllib.error.URLError as e:
+        print(f"❌ HA nedostupné: {e.reason}")
+    except Exception as e:
+        print(f"❌ HA chyba: {e}")
+    return None
+
+
+def ha_watch_restart_button(stop_event: threading.Event):
+    """
+    Sleduje input_button.tc_restart přes HA REST API.
+    Při změně atributu last_triggered nebo stavu (state) spustí RESTART_COMMAND.
+    """
+    ts = lambda: datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    print(f"👂 [{ts()}] Sleduji {HA_ENTITY} přes HA API ({HA_URL})")
+    last_triggered = None
+    first = True
+    consecutive_errors = 0
+
+    while not stop_event.is_set():
+        data = ha_get_state(HA_ENTITY)
+
+        if data is None:
+            consecutive_errors += 1
+            if consecutive_errors == 1 or consecutive_errors % 30 == 0:
+                print(f"⚠️  [{ts()}] HA nedostupné (chyba #{consecutive_errors}), "
+                      f"zkouším dál každých {HA_POLL_INTERVAL}s")
+        else:
+            consecutive_errors = 0
+            
+            # HA vrací čas stisku buď v atributu last_triggered, nebo přímo ve state
+            current = data.get("attributes", {}).get("last_triggered")
+            if not current:
+                current = data.get("state")
+
+            if first:
+                print(f"   [{ts()}] Výchozí čas stisku = {current}")
+                last_triggered = current
+                first = False
+            elif current != last_triggered:
+                print(f"🔄 [{ts()}] Tlačítko stisknuto! "
+                      f"čas: {last_triggered} → {current}")
+                last_triggered = current
+                print(f"🔁 [{ts()}] Spouštím: {' '.join(RESTART_COMMAND)}")
+                try:
+                    subprocess.Popen(RESTART_COMMAND)
+                except Exception as e:
+                    print(f"❌ [{ts()}] Chyba restartu: {e}")
+                stop_event.wait(5)
+                return
+
+        stop_event.wait(HA_POLL_INTERVAL)
+
+    print(f"👂 [{ts()}] HA watcher ukončen")
+# ================================================
 
 
 # ============ MQTT ============
@@ -217,7 +372,7 @@ def mqtt_connect() -> mqtt.Client:
 
 
 def publish_discovery(client: mqtt.Client):
-    """Publikuje HA Discovery pro všechny OBIS z OBIS_CONFIG (s časem)."""
+    """Publikuje HA Discovery pro OBIS z OBIS_CONFIG, kde discovery != False."""
     ts = lambda: datetime.now().strftime("%H:%M:%S")
 
     device_info = {
@@ -229,9 +384,14 @@ def publish_discovery(client: mqtt.Client):
 
     print(f"  [{ts()}] Začínám Discovery ({len(OBIS_CONFIG)} OBIS)...")
 
+    published = 0
     for obis, cfg in OBIS_CONFIG.items():
         key = cfg.get("key")
         if not key:
+            continue
+
+        if cfg.get("discovery", True) is False:
+            print(f"  [{ts()}] ⏭️  Discovery skip: {key} (discovery=False)")
             continue
 
         unique_id = f"{DEVICE_ID}_{key}"
@@ -240,6 +400,7 @@ def publish_discovery(client: mqtt.Client):
 
         payload = {
             "name": cfg.get("name", key),
+            "object_id": cfg.get("object_id", unique_id),
             "unique_id": unique_id,
             "state_topic": state_topic,
             "device": device_info,
@@ -264,11 +425,27 @@ def publish_discovery(client: mqtt.Client):
                 payload["state_class"] = cfg["state_class"]
 
         client.publish(config_topic, json.dumps(payload), retain=True)
+        published += 1
         print(f"  [{ts()}] 📡 Discovery: {key:30} → {config_topic}")
 
     client.publish(f"{MQTT_PREFIX}/{DEVICE_ID}/status", "online", retain=True)
     print(f"  [{ts()}] 📡 Status: {MQTT_PREFIX}/{DEVICE_ID}/status = online")
-    print(f"  [{ts()}] ✅ Discovery publikováno pro {len(OBIS_CONFIG)} OBIS")
+    print(f"  [{ts()}] ✅ Discovery publikováno pro {published}/{len(OBIS_CONFIG)} OBIS")
+
+
+def cleanup_disabled_discovery(client: mqtt.Client):
+    """Smaže retained Discovery configy pro entity, které už nechceme."""
+    ts = lambda: datetime.now().strftime("%H:%M:%S")
+    if not DISCOVERY_DISABLED:
+        print(f"  [{ts()}] 🧹 Není co mazat (DISCOVERY_DISABLED je prázdný)")
+        return
+        
+    print(f"  [{ts()}] 🧹 Mažu staré Discovery configy ({len(DISCOVERY_DISABLED)})...")
+    for key in DISCOVERY_DISABLED:
+        config_topic = f"{DISCOVERY_PREFIX}/sensor/{DEVICE_ID}/{key}/config"
+        client.publish(config_topic, payload="", retain=True)
+        print(f"  [{ts()}] 🗑️  {key:30} → {config_topic}")
+    time.sleep(0.5)
 
 
 def publish_values(client: mqtt.Client, data: dict):
@@ -334,6 +511,10 @@ def run_discovery_and_exit():
     print(f"✅ MQTT připraveno [{ts()}]")
     print()
 
+    print(f"🧹 Čistím staré Discovery configy... [{ts()}]")
+    cleanup_disabled_discovery(client)
+    print()
+
     print(f"📡 Publikuji HA Discovery... [{ts()}]")
     publish_discovery(client)
     print(f"✅ Discovery dokončeno [{ts()}]")
@@ -384,6 +565,7 @@ def run_forever():
     print(f"Port: {PORT} @ {BAUDRATE} 8N1")
     print(f"MQTT: {MQTT_HOST} (user: {MQTT_USER})")
     print(f"MQTT prefix: {MQTT_PREFIX}")
+    print(f"HA API: {HA_URL} (entita: {HA_ENTITY})")
     print()
 
     print(f"🔌 Připojuji MQTT... [{ts()}]")
@@ -391,10 +573,24 @@ def run_forever():
     print(f"✅ MQTT připraveno [{ts()}]")
     print()
 
+    print(f"🧹 Čistím staré Discovery configy... [{ts()}]")
+    cleanup_disabled_discovery(client)
+    print()
+
     print(f"📡 Publikuji HA Discovery... [{ts()}]")
     publish_discovery(client)
     print(f"✅ Discovery dokončeno [{ts()}]")
     print()
+
+    # Spustit HA watcher ve vlákně
+    stop_event = threading.Event()
+    ha_thread = threading.Thread(
+        target=ha_watch_restart_button,
+        args=(stop_event,),
+        daemon=True,
+        name="ha-restart-watcher",
+    )
+    ha_thread.start()
 
     parser = CosemParser()
 
@@ -424,14 +620,34 @@ def run_forever():
     except KeyboardInterrupt:
         print(f"\n[{ts()}] 🛑 Přerušeno uživatelem")
     finally:
+        stop_event.set()
         client.publish(f"{MQTT_PREFIX}/{DEVICE_ID}/status", "offline", retain=True)
         print(f"[{ts()}] 📡 Status: offline")
         client.loop_stop()
         client.disconnect()
 
 
+def run_cleanup_and_exit():
+    """Jednorázově smaže staré Discovery configy a skončí."""
+    ts = lambda: datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    print(f"🧹 Režim: CLEANUP – {ts()}")
+    print(f"MQTT: {MQTT_HOST} (user: {MQTT_USER})")
+    print()
+
+    client = mqtt_connect()
+    try:
+        cleanup_disabled_discovery(client)
+        time.sleep(1)
+    finally:
+        client.loop_stop()
+        client.disconnect()
+        print(f"🔚 Cleanup dokončen [{ts()}]")
+
+
 def main():
-    if "--discovery" in sys.argv:
+    if "--cleanup" in sys.argv:
+        run_cleanup_and_exit()
+    elif "--discovery" in sys.argv:
         run_discovery_and_exit()
     else:
         run_forever()
@@ -439,4 +655,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
