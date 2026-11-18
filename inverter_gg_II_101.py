@@ -70,7 +70,7 @@ MQTT_password         = 'Grand_Glow_03'                  # your MQTT password
 broker = "192.168.1.22"                                  # MQTT Broker
 MQTT_port = 1883                                         # MQTT port
 state_topic = "homeassistant/sensor/gg/state"            # MQTT topic
-client_id = 'c67350b3bd694128b12d8f77a18e5aa4'           # HA client id
+client_id = 'client'           # HA client id
 debug = 1
 
 #----------------------MQTT listaen------------------------
